@@ -1,0 +1,12 @@
+# Go build and test artifacts
+/bin/
+*.test
+*.out
+coverage.*
+
+# Go workspace files are per-developer
+go.work
+go.work.sum
+
+# Local environment
+.env

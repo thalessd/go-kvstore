@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Vet, format and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Vet and format
+        run: make check
+
+      - name: Fail if the module is not tidy
+        run: make tidy
+
+      - name: Unit tests
+        run: make test-race
+
+  integration:
+    name: Contract tests against a real PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # Matches compose.yaml, so a local run and CI exercise the same server.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: kvstore
+          POSTGRES_USER: kvstore
+          POSTGRES_PASSWORD: kvstore
+        ports:
+          - 55433:5432
+        options: >-
+          --health-cmd "pg_isready -U kvstore -d kvstore"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Contract tests
+        run: make test-integration
