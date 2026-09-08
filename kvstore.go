@@ -8,9 +8,10 @@
 // entry; philippgille/gokv (https://github.com/philippgille/gokv) for Go
 // contributes the single Store interface every backend implements, with JSON
 // as the value codec. Both were the basis for this package. It is a port of
-// neither: expiry is a time.Time rather than a millisecond count, every
-// method carries a context.Context, and the typed generic Cache[T] sits on
-// top of a codec-free Store.
+// neither: expiry is a time.Time in the API rather than a millisecond count,
+// every method carries a context.Context, and the typed generic Cache[T] sits
+// on top of a codec-free Store. The Postgres table itself follows keyv, down
+// to the millisecond epoch the moment is stored as.
 //
 // Production code here depends on the standard library alone. The Postgres
 // store keeps its SQL as per-instance statements behind a local DBTX, and
@@ -33,7 +34,12 @@ import (
 //   - Delete is idempotent: deleting keys that do not exist is not an error.
 //   - A value whose expires moment is not zero expires: reads stop seeing it
 //     and a best-effort reclamation follows (lazy eviction or a sweep).
+//   - Get returns the bytes Set was given, unchanged. A backend must not
+//     reformat the value.
 //   - Empty namespace and empty key are caller preconditions, not validated.
+//   - So is a namespace or key of at most 255 characters. A backend may store
+//     them in a column that narrow, so a caller deriving a key from something
+//     unbounded — a URL, a query string — hashes it first.
 type Store interface {
 	Get(ctx context.Context, namespace, key string) (json.RawMessage, bool, error)
 	Set(ctx context.Context, namespace, key string, value json.RawMessage, expires time.Time) error

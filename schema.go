@@ -7,6 +7,14 @@ import (
 	"slices"
 )
 
+// Column widths, and the keyv defaults. Declaring them keeps a key derived
+// from something attacker-controlled — a URL, a query string — from reaching
+// the primary key's btree, whose index row cannot exceed 2704 bytes.
+const (
+	maxNamespaceLen = 255
+	maxKeyLen       = 255
+)
+
 // EnsureSchema creates the schema, table and index when they do not exist
 // yet. It is idempotent, so every replica may call it at boot.
 //
@@ -22,19 +30,20 @@ func (p *Postgres) EnsureSchema(ctx context.Context) error {
 	statements := []string{
 		`CREATE SCHEMA IF NOT EXISTS ` + quoteIdent(p.opts.schema),
 
+		// value is TEXT, not JSONB: nothing here reads inside the document,
+		// and a parsing column would reorder keys and drop whitespace, so the
+		// bytes Get returns would stop being the bytes Set was given.
 		fmt.Sprintf(`CREATE%s TABLE IF NOT EXISTS %s (
-    namespace   TEXT NOT NULL,
-    key         TEXT NOT NULL,
-    value       JSONB NOT NULL,
-    expires_at  TIMESTAMPTZ NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    namespace  VARCHAR(%d) NOT NULL,
+    key        VARCHAR(%d) NOT NULL,
+    value      TEXT        NOT NULL,
+    expires    BIGINT      NULL,
     PRIMARY KEY (namespace, key)
-)`, unlogged, p.opts.relation()),
+)`, unlogged, p.opts.relation(), maxNamespaceLen, maxKeyLen),
 
 		// Partial, so a sweep scans only what can expire.
 		`CREATE INDEX IF NOT EXISTS ` + quoteIdent(p.opts.table+"_expires_idx") +
-			` ON ` + p.opts.relation() + ` (expires_at) WHERE expires_at IS NOT NULL`,
+			` ON ` + p.opts.relation() + ` (expires) WHERE expires IS NOT NULL`,
 	}
 
 	// One statement per Exec: the extended protocol takes no multi-statement

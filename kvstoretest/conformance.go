@@ -145,6 +145,23 @@ func Conformance(t *testing.T, store kvstore.Reaper) {
 		}
 	})
 
+	// A store is a byte channel, not a JSON document store: a caller that
+	// hashes or signs what it wrote has to read back the same bytes. A backend
+	// that parses the value normalizes key order and whitespace, and the
+	// scalars the subtests above use survive that unchanged — so an object is
+	// the only fixture that catches it.
+	t.Run("value round-trips byte for byte", func(t *testing.T) {
+		exact := json.RawMessage(`{"zeta":1,  "alpha":{"nested":true},"beta":[1,2,3]}`)
+		if err := store.Set(ctx, "conf-exact", "doc", exact, time.Time{}); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+		raw, found, err := store.Get(ctx, "conf-exact", "doc")
+		if err != nil || !found {
+			t.Fatalf("get: found=%v err=%v", found, err)
+		}
+		assertJSON(t, raw, string(exact))
+	})
+
 	// Runs last, and asserts a lower bound rather than an exact count: the
 	// subtests above leave expired entries behind on purpose.
 	t.Run("purge reclaims only what expired", func(t *testing.T) {

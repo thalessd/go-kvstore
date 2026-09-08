@@ -35,7 +35,7 @@ func TestPostgresGet(t *testing.T) {
 	t.Run("hit", func(t *testing.T) {
 		rows := sqlmock.NewRows([]string{"value"}).AddRow([]byte(`"v1"`))
 		mock.ExpectQuery(sqlMatch("SELECT value FROM "+defaultRelation)).
-			WithArgs("ns", "k1", anyTime()).
+			WithArgs("ns", "k1", anyEpoch()).
 			WillReturnRows(rows)
 
 		raw, found, err := store.Get(t.Context(), "ns", "k1")
@@ -47,7 +47,7 @@ func TestPostgresGet(t *testing.T) {
 
 	t.Run("miss is not an error", func(t *testing.T) {
 		mock.ExpectQuery(sqlMatch("SELECT value FROM "+defaultRelation)).
-			WithArgs("ns", "absent", anyTime()).
+			WithArgs("ns", "absent", anyEpoch()).
 			WillReturnRows(sqlmock.NewRows([]string{"value"}))
 
 		raw, found, err := store.Get(t.Context(), "ns", "absent")
@@ -64,7 +64,7 @@ func TestPostgresSet(t *testing.T) {
 
 		expires := time.Date(2026, 9, 8, 13, 0, 0, 0, time.UTC)
 		mock.ExpectExec(sqlMatch("INSERT INTO "+defaultRelation)).
-			WithArgs("ns", "k1", []byte(`"v1"`), expires).
+			WithArgs("ns", "k1", `"v1"`, expires.UnixMilli()).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		if err := store.Set(t.Context(), "ns", "k1", json.RawMessage(`"v1"`), expires); err != nil {
@@ -73,13 +73,14 @@ func TestPostgresSet(t *testing.T) {
 	})
 
 	// A zero expiry moment means "never", which reaches the driver as an
-	// invalid NullTime rather than the zero instant.
+	// invalid NullInt64 rather than the epoch of the zero instant, which is a
+	// large negative number and would read as long expired.
 	t.Run("without expiry", func(t *testing.T) {
 		db, mock := newMockDB(t)
 		store := newStore(t, db)
 
 		mock.ExpectExec(sqlMatch("INSERT INTO "+defaultRelation)).
-			WithArgs("ns", "k1", []byte(`"v1"`), nil).
+			WithArgs("ns", "k1", `"v1"`, nil).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		if err := store.Set(t.Context(), "ns", "k1", json.RawMessage(`"v1"`), time.Time{}); err != nil {
@@ -112,7 +113,7 @@ func TestPostgresHas(t *testing.T) {
 	store := newStore(t, db)
 
 	mock.ExpectQuery(sqlMatch("SELECT EXISTS")).
-		WithArgs("ns", "k1", anyTime()).
+		WithArgs("ns", "k1", anyEpoch()).
 		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 
 	ok, err := store.Has(t.Context(), "ns", "k1")
@@ -138,8 +139,8 @@ func TestPostgresPurgeExpired(t *testing.T) {
 	db, mock := newMockDB(t)
 	store := newStore(t, db)
 
-	mock.ExpectExec(sqlMatch("DELETE FROM " + defaultRelation + " WHERE expires_at")).
-		WithArgs(anyTime()).
+	mock.ExpectExec(sqlMatch("DELETE FROM " + defaultRelation + " WHERE expires")).
+		WithArgs(anyEpoch()).
 		WillReturnResult(sqlmock.NewResult(0, 7))
 
 	removed, err := store.PurgeExpired(t.Context(), time.Now())
@@ -157,7 +158,7 @@ func TestPostgresQualifiesTheConfiguredRelation(t *testing.T) {
 	store := newStore(t, db, WithSchema("kv_alt"), WithTable("cache"))
 
 	mock.ExpectQuery(sqlMatch(`SELECT value FROM "kv_alt"."cache"`)).
-		WithArgs("ns", "k1", anyTime()).
+		WithArgs("ns", "k1", anyEpoch()).
 		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow([]byte(`1`)))
 
 	if _, _, err := store.Get(t.Context(), "ns", "k1"); err != nil {
@@ -173,7 +174,7 @@ func TestPostgresWithTxKeepsTheConfiguredRelation(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectExec(sqlMatch(`INSERT INTO "kv_alt"."entries"`)).
-		WithArgs("ns", "k1", []byte(`1`), nil).
+		WithArgs("ns", "k1", `1`, nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 

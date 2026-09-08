@@ -55,9 +55,14 @@ func (stringArrayConverter) ConvertValue(v any) (driver.Value, error) {
 	return driver.DefaultParameterConverter.ConvertValue(v)
 }
 
-// anyTime matches a timestamp the store computes itself.
-func anyTime() sqlmock.Argument { return anyTimeArg{} }
+// anyEpoch matches the millisecond moment the store computes itself, and
+// asserts the type, so a parameter that stopped being an epoch fails here
+// rather than silently reaching a BIGINT column as something else.
+func anyEpoch() sqlmock.Argument { return anyEpochArg{} }
 
-type anyTimeArg struct{}
+type anyEpochArg struct{}
 
-func (anyTimeArg) Match(driver.Value) bool { return true }
+func (anyEpochArg) Match(v driver.Value) bool {
+	_, ok := v.(int64)
+	return ok
+}

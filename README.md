@@ -6,6 +6,7 @@ A namespaced key-value store for Go with pluggable backends. Values are JSON, ke
 
 - **Two backends included** — an in-process `MemoryStore` and a durable `Postgres` store.
 - **One contract, verified** — `kvstoretest.Conformance` is a runnable suite every backend must pass, so two stores cannot quietly disagree about what `Store` means.
+- **Byte-transparent** — `Get` returns exactly the bytes `Set` was given. The value column is `TEXT`, not `JSONB`, so nothing reorders your object's keys or strips its whitespace.
 - **A typed layer on top** — `Cache[T]` binds a namespace and a default TTL and handles the JSON, leaving `Store` codec-free.
 - **The library owns its schema** — the Postgres store creates and manages its own PostgreSQL schema, so the application embedding it carries no migration for someone else's table.
 - **No dependencies in production code** — the standard library only. The driver and the mock are test-only.
@@ -47,7 +48,21 @@ if err := store.EnsureSchema(ctx); err != nil {
 }
 ```
 
-That creates `kvstore.entries` plus a partial index on `expires_at`. Nothing else in your database is touched, and every statement the store issues names the relation fully qualified — so it shares a connection pool with your application without depending on its `search_path`.
+That creates `kvstore.entries` plus a partial index on `expires`. Nothing else in your database is touched, and every statement the store issues names the relation fully qualified — so it shares a connection pool with your application without depending on its `search_path`.
+
+The table follows [`@keyv/postgres`](https://github.com/jaredwray/keyv/tree/main/storage/postgres) v6:
+
+```sql
+CREATE TABLE kvstore.entries (
+    namespace  VARCHAR(255) NOT NULL,
+    key        VARCHAR(255) NOT NULL,
+    value      TEXT         NOT NULL,
+    expires    BIGINT       NULL,      -- millisecond epoch, NULL means never
+    PRIMARY KEY (namespace, key)
+)
+```
+
+You never write this DDL, and you should not depend on it — but the widths are worth knowing: a key derived from something unbounded, like a URL or a query string, has to be hashed to fit 255 characters.
 
 Reads filter expiry themselves, so nothing depends on a sweep being prompt. Call `PurgeExpired` from a cleanup ticker to keep the table from growing without bound:
 
@@ -90,6 +105,9 @@ Any type satisfying `Store` must honour all of this, and `kvstoretest.Conformanc
 3. `Delete` is idempotent: deleting keys that do not exist is not an error.
 4. A non-zero expiry moment expires: reads stop seeing the entry, and a best-effort reclamation follows.
 5. `Clear` never leaves its namespace.
+6. `Get` returns the bytes `Set` was given, unchanged — a backend must not reformat the value.
+
+An empty namespace or key, and one longer than 255 characters, are caller preconditions rather than validated inputs.
 
 ```go
 func TestMyStore(t *testing.T) {
@@ -120,7 +138,19 @@ make db-down
 - **[keyv](https://github.com/jaredwray/keyv)** (Node.js) — namespaced keys, pluggable stores and a TTL per entry.
 - **[philippgille/gokv](https://github.com/philippgille/gokv)** (Go) — one `Store` interface every backend implements, with JSON as the value codec.
 
-Both were the basis for this library. It is a port of neither: expiry is a `time.Time` rather than a millisecond count, every method carries a `context.Context`, and the typed generic `Cache[T]` sits on top of a codec-free `Store`.
+Both were the basis for this library. It is a port of neither: **the API** takes an expiry `time.Time` rather than a millisecond count, every method carries a `context.Context`, and the typed generic `Cache[T]` sits on top of a codec-free `Store`. The Postgres **table** is keyv's, down to the millisecond epoch the moment is stored as — the divergence is in the Go surface, not in the storage.
+
+## Upgrading to v0.2.0
+
+The Go API is unchanged; the table is not. `value` went from `JSONB` to `TEXT`, `expires_at TIMESTAMPTZ` became `expires BIGINT` in milliseconds, `created_at` / `updated_at` are gone, and `namespace` / `key` are capped at 255 characters.
+
+**There is no migration.** Drop the schema and let `EnsureSchema` rebuild it at boot:
+
+```sql
+DROP SCHEMA IF EXISTS kvstore CASCADE;
+```
+
+If you forget, you get an error rather than corruption: `expires_at` no longer exists under that name, so a surviving `v0.1.0` table fails the first `Get` with `42703 column "expires" does not exist`, and no write lands in the old shape.
 
 ## License
 
