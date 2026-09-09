@@ -86,6 +86,20 @@ session, found, err := sessions.Get(ctx, id)
 err = sessions.Delete(ctx, id)
 ```
 
+### The entry, with its expiry
+
+`Get` answers with the bytes. `GetEntry` answers with the bytes *and* the moment they expire, which is what a caller copying an entry into another store needs — without it the copy has to invent a TTL, and one that outlives the original serves what the original has already forgotten:
+
+```go
+entry, found, err := store.GetEntry(ctx, "sessions", id)
+if found {
+    // entry.Value is the bytes; entry.Expires is zero when the entry never expires.
+    err = other.Set(ctx, "sessions", id, entry.Value, entry.Expires)
+}
+```
+
+`GetEntry` filters expiry exactly as `Get` does, so an expired entry is a miss and a copy can never revive one. The moment comes back to within a millisecond of what `Set` was given and never later than it — the Postgres store keeps a millisecond epoch — so compare it with `Equal` and a tolerance, not `==`.
+
 ## Configuration
 
 | Option | Default | What it does |
@@ -137,6 +151,8 @@ Any type satisfying `Store` must honour all of this, and `kvstoretest.Conformanc
 4. A non-zero expiry moment expires: reads stop seeing the entry, and a best-effort reclamation follows.
 5. `Clear` never leaves its namespace.
 6. `Get` returns the bytes `Set` was given, unchanged — a backend must not reformat the value.
+7. `GetEntry` answers with the value **and its expiry moment**, filtering expiry exactly as `Get` does — an expired entry is a miss, so copying an entry into another store cannot revive one. `Entry.Expires` is zero when the entry never expires, and `Get` and `GetEntry` agree on both visibility and bytes.
+8. The expiry moment round-trips to within a millisecond, and **never later** than what `Set` was given. A backend may truncate it and may return it in another location, so compare with `Equal` and a tolerance rather than `==`.
 
 An empty namespace or key, and one longer than 255 characters, are caller preconditions rather than validated inputs.
 
@@ -170,6 +186,20 @@ make db-down
 - **[philippgille/gokv](https://github.com/philippgille/gokv)** (Go) — one `Store` interface every backend implements, with JSON as the value codec.
 
 Both were the basis for this library. It is a port of neither: **the API** takes an expiry `time.Time` rather than a millisecond count, every method carries a `context.Context`, and the typed generic `Cache[T]` sits on top of a codec-free `Store`. The Postgres **table** is keyv's, down to the millisecond epoch the moment is stored as — the divergence is in the Go surface, not in the storage.
+
+## Upgrading to v0.4.0
+
+`Store` gained a method: `GetEntry(ctx, namespace, key) (Entry, bool, error)`. The table is unchanged, so there is nothing to migrate.
+
+Both bundled stores implement it. A backend of your own does not, and the compiler says so — the break is a build failure, never a wrong answer at runtime. A type that **embeds** `kvstore.Store` inherits the method and needs no change; one that implements the five by hand needs a sixth:
+
+```go
+func (s *MyStore) GetEntry(ctx context.Context, namespace, key string) (kvstore.Entry, bool, error) {
+    // Same expiry filtering as Get: an expired entry is a miss.
+}
+```
+
+`kvstoretest.Conformance` covers the new method, so a backend that passes the suite is done.
 
 ## Upgrading to v0.2.0
 

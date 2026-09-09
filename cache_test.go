@@ -22,8 +22,15 @@ type setCall struct {
 	expires        time.Time
 }
 
-func (s *recordingStore) Get(_ context.Context, _, _ string) (json.RawMessage, bool, error) {
-	return s.raw, s.found, s.err
+func (s *recordingStore) Get(ctx context.Context, namespace, key string) (json.RawMessage, bool, error) {
+	entry, found, err := s.GetEntry(ctx, namespace, key)
+	return entry.Value, found, err
+}
+
+// GetEntry is the primitive here too, so the fake cannot answer a Get the way
+// no real backend would.
+func (s *recordingStore) GetEntry(_ context.Context, _, _ string) (Entry, bool, error) {
+	return Entry{Value: s.raw}, s.found, s.err
 }
 
 func (s *recordingStore) Set(_ context.Context, namespace, key string, value json.RawMessage, expires time.Time) error {

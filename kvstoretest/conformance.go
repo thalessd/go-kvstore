@@ -27,6 +27,16 @@ func assertJSON(t *testing.T, got json.RawMessage, want string) {
 	}
 }
 
+// assertMoment allows the millisecond a backend may truncate and refuses the
+// direction that matters: a moment read back as later than it was set would
+// let an entry outlive its window.
+func assertMoment(t *testing.T, got, want time.Time) {
+	t.Helper()
+	if got.After(want) || want.Sub(got) >= time.Millisecond {
+		t.Errorf("expires = %v, want %v within a millisecond and not later", got, want)
+	}
+}
+
 // Conformance exercises the contract documented on kvstore.Store: miss is
 // (nil, false, nil), Set upserts, Delete is idempotent, expiry hides entries,
 // and a Clear never leaves its namespace. It takes a Reaper so the sweep is
@@ -160,6 +170,52 @@ func Conformance(t *testing.T, store kvstore.Reaper) {
 			t.Fatalf("get: found=%v err=%v", found, err)
 		}
 		assertJSON(t, raw, string(exact))
+	})
+
+	// A tier copies an entry from one store into another and needs the expiry
+	// moment to do it: without it the copy invents a TTL, and one that outlives
+	// the original serves what the original has already forgotten.
+	t.Run("an entry carries the expiry it was set with", func(t *testing.T) {
+		expires := time.Now().Add(time.Hour)
+		if err := store.Set(ctx, "conf-entry", "expiring", mustJSON(t, "v"), expires); err != nil {
+			t.Fatalf("set expiring: %v", err)
+		}
+		entry, found, err := store.GetEntry(ctx, "conf-entry", "expiring")
+		if err != nil || !found {
+			t.Fatalf("get entry: found=%v err=%v", found, err)
+		}
+		assertJSON(t, entry.Value, `"v"`)
+		assertMoment(t, entry.Expires, expires)
+
+		if err := store.Set(ctx, "conf-entry", "forever", mustJSON(t, "v"), time.Time{}); err != nil {
+			t.Fatalf("set forever: %v", err)
+		}
+		entry, found, err = store.GetEntry(ctx, "conf-entry", "forever")
+		if err != nil || !found {
+			t.Fatalf("get entry with no expiry: found=%v err=%v", found, err)
+		}
+		if !entry.Expires.IsZero() {
+			t.Errorf("expires = %v, want zero for an entry that never expires", entry.Expires)
+		}
+
+		// An expired entry is a miss here too, or a copy would revive one.
+		if err := store.Set(ctx, "conf-entry", "stale", mustJSON(t, "v"), time.Now().Add(-time.Second)); err != nil {
+			t.Fatalf("set stale: %v", err)
+		}
+		if entry, found, err := store.GetEntry(ctx, "conf-entry", "stale"); found || err != nil || entry.Value != nil {
+			t.Errorf("GetEntry on an expired entry: entry=%+v found=%v err=%v", entry, found, err)
+		}
+
+		// The two reads must not disagree about the bytes.
+		raw, _, err := store.Get(ctx, "conf-entry", "expiring")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		entry, _, err = store.GetEntry(ctx, "conf-entry", "expiring")
+		if err != nil {
+			t.Fatalf("get entry: %v", err)
+		}
+		assertJSON(t, entry.Value, string(raw))
 	})
 
 	// Runs last, and asserts a lower bound rather than an exact count: the

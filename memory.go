@@ -34,16 +34,21 @@ func NewMemory() *MemoryStore {
 	return &MemoryStore{data: map[string]map[string]memoryEntry{}, now: time.Now}
 }
 
-func (s *MemoryStore) Get(_ context.Context, namespace, key string) (json.RawMessage, bool, error) {
+func (s *MemoryStore) Get(ctx context.Context, namespace, key string) (json.RawMessage, bool, error) {
+	entry, found, err := s.GetEntry(ctx, namespace, key)
+	return entry.Value, found, err
+}
+
+func (s *MemoryStore) GetEntry(_ context.Context, namespace, key string) (Entry, bool, error) {
 	// RUnlock before returning: the entry value is never mutated in place, so
 	// the slice stays valid after the lock is gone.
 	s.mu.RLock()
 	entry, ok := s.data[namespace][key]
 	s.mu.RUnlock()
 	if !ok || entry.expired(s.now()) {
-		return nil, false, nil
+		return Entry{}, false, nil
 	}
-	return entry.value, true, nil
+	return Entry{Value: entry.value, Expires: entry.expires}, true, nil
 }
 
 func (s *MemoryStore) Set(_ context.Context, namespace, key string, value json.RawMessage, expires time.Time) error {

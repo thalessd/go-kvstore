@@ -25,6 +25,13 @@ import (
 	"time"
 )
 
+// Entry is a value with the metadata a caller needs to reproduce it in another
+// store. Expires is zero when the entry never expires.
+type Entry struct {
+	Value   json.RawMessage
+	Expires time.Time
+}
+
 // Store persists values under (namespace, key). Implementations must be safe
 // for concurrent use.
 //
@@ -36,12 +43,20 @@ import (
 //     and a best-effort reclamation follows (lazy eviction or a sweep).
 //   - Get returns the bytes Set was given, unchanged. A backend must not
 //     reformat the value.
+//   - GetEntry answers with the value and its expiry moment, filtering expiry
+//     exactly as Get does: an expired entry is a miss, so a caller copying an
+//     entry into another store cannot revive one. A miss returns the zero
+//     Entry, and Get and GetEntry agree on both visibility and bytes.
+//   - The expiry moment round-trips to within a millisecond and never later
+//     than what Set was given. A backend may truncate it and may return it in
+//     another location, so compare it with Equal and a tolerance, not ==.
 //   - Empty namespace and empty key are caller preconditions, not validated.
 //   - So is a namespace or key of at most 255 characters. A backend may store
 //     them in a column that narrow, so a caller deriving a key from something
 //     unbounded — a URL, a query string — hashes it first.
 type Store interface {
 	Get(ctx context.Context, namespace, key string) (json.RawMessage, bool, error)
+	GetEntry(ctx context.Context, namespace, key string) (Entry, bool, error)
 	Set(ctx context.Context, namespace, key string, value json.RawMessage, expires time.Time) error
 	Delete(ctx context.Context, namespace string, keys ...string) error
 	Has(ctx context.Context, namespace, key string) (bool, error)

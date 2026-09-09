@@ -31,7 +31,7 @@ The Postgres **table**, on the other hand, is keyv's — column names, widths, `
 ## Layout
 
 ```text
-kvstore.go                     Package doc, Store, Purger, Reaper
+kvstore.go                     Package doc, Store, Entry, Purger, Reaper
 options.go                     Option, WithSchema / WithTable / WithPersistence
 ident.go                       Identifier validation and quoting
 memory.go                      MemoryStore
@@ -65,7 +65,8 @@ make tidy             # go mod tidy, failing if it was not already tidy
 
 | Symbol | What it is |
 | :--- | :--- |
-| `Store` | `Get` / `Set` / `Delete` / `Has` / `Clear` — the contract every backend implements |
+| `Store` | `Get` / `GetEntry` / `Set` / `Delete` / `Has` / `Clear` — the contract every backend implements |
+| `Entry` | `Value json.RawMessage` + `Expires time.Time`; what `GetEntry` answers with, and what a caller needs to copy an entry into another store |
 | `Purger` | `PurgeExpired(ctx, now) (int64, error)` — the explicit sweep |
 | `Reaper` | `Store` + `Purger`; what a long-lived application holds |
 | `DBTX` | What the Postgres store needs from a handle; `*sql.DB` and `*sql.Tx` satisfy it |
@@ -111,8 +112,10 @@ Documented on `Store` and pinned by `kvstoretest.Conformance`:
 4. **A non-zero expiry moment expires.** Reads stop seeing the entry, and a best-effort reclamation follows — lazy eviction or a sweep.
 5. **`Clear` never leaves its namespace.**
 6. **`Get` returns the bytes `Set` was given, unchanged.** A backend must not reformat the value. The conformance case that pins this uses an *object* with a deliberate key order and non-canonical whitespace, because scalars survive a JSON-parsing column untouched and would not catch the divergence.
-7. **Empty namespace and empty key are caller preconditions**, not validated.
-8. **So is a namespace or key of at most 255 characters.** A backend may store them in a column that narrow, so a caller deriving a key from something unbounded — a URL, a query string — hashes it first. Not validated in Go: the Postgres store raises `22001` and the caller sees it.
+7. **`GetEntry` answers with the value and its expiry moment**, filtering expiry exactly as `Get` does — an expired entry is a miss, so a caller propagating an entry to another store cannot revive one. `Entry.Expires` is zero when the entry never expires, and `Get` and `GetEntry` must agree on visibility and on bytes.
+8. **The expiry moment round-trips to within a millisecond, and never later than what `Set` was given.** A backend may truncate it and may return it in another location — the Postgres store keeps a millisecond epoch and normalizes to UTC — so the conformance case compares with a tolerance rather than `==`. Never later is the direction that matters: a moment that read back as later than asked would let an entry outlive its window.
+9. **Empty namespace and empty key are caller preconditions**, not validated.
+10. **So is a namespace or key of at most 255 characters.** A backend may store them in a column that narrow, so a caller deriving a key from something unbounded — a URL, a query string — hashes it first. Not validated in Go: the Postgres store raises `22001` and the caller sees it.
 
 **A new backend is not done until it passes `kvstoretest.Conformance`.** The suite takes a `Reaper`, so the sweep is covered too.
 
@@ -129,6 +132,8 @@ These are the invariants a change must not break.
 - **`EnsureSchema` is a method, `DropSchema` is a free function.** Binding creation to the instance makes "the schema I created is the schema I read" true by construction. Destruction stays deliberately separate, and refuses `public`, because the drop is `CASCADE`.
 - **`EnsureSchema` is idempotent and race-tolerant.** `IF NOT EXISTS` does not settle a concurrent first boot — PostgreSQL checks existence before taking the catalog lock — so a duplicate-object SQLSTATE is treated as success. The check asserts `interface{ SQLState() string }` structurally, which is how the package tolerates the race without depending on a driver.
 - **"now" is always a Go-computed parameter.** No statement and no column reads the server's clock — there is no `DEFAULT now()` anywhere, and `epoch()` in `postgres.go` converts the moment at the boundary. A zero `time.Time` has to reach the column as `NULL`: `UnixMilli` of it is a large negative number, which would read as long expired.
+- **One get statement, not two.** `GetEntry` is the primitive and `Get` delegates to it in both backends. Two statements — one selecting `value`, one selecting `value, expires` — would be free to drift in their `WHERE`, and a difference there is exactly the divergence contract item 7 forbids. The cost is one `BIGINT` scanned per `Get`.
+- **The moment leaves the store in UTC.** `momentOf` normalizes what `time.UnixMilli` returns in the local zone, because `Cache[T]` hands `Set` a UTC moment and a round trip through the column must not change the zone. Pinned in the unit tier: the integration tier asserts no location.
 - **The value column is `TEXT`, and stays `TEXT`.** `JSONB` would reformat what a caller stored, breaking contract item 6. `Get` scans into a `string` and converts, because `database/sql` assigns a driver string to `*[]byte` but not to a named slice type like `json.RawMessage`.
 - **`Delete` passes a `[]string` to `key = ANY($2)`,** which requires a driver that encodes a Go slice as a PostgreSQL array. `pgx/v5/stdlib` does; `lib/pq` needs `pq.Array` and is therefore unsupported as-is.
 - **`WithTx` clones the store.** A copy that lost its layout would write to the default relation while the original reads a configured one.
@@ -181,6 +186,14 @@ Conventional Commits, with the description in **English**:
 ## Compatibility
 
 Semantic versioning, currently pre-1.0: the API may still change, and a breaking change ships as a `v0.x` bump rather than a new module path. Licensed under BSD-3-Clause.
+
+### v0.4.0 — `Store` gained `GetEntry`
+
+`Store` is six methods now: `GetEntry(ctx, namespace, key) (Entry, bool, error)` sits beside `Get` and answers with the value and its expiry moment. The table is unchanged, so there is nothing to migrate.
+
+The break is a compile error, which is what makes it acceptable: a backend that does not implement the method fails to build rather than answering wrongly at runtime. A type embedding `kvstore.Store` inherits it and needs no change.
+
+The method exists for a caller copying an entry from one store into another. Without the expiry moment that copy has to invent a TTL, and a copy that outlives its origin serves entries the origin has already forgotten.
 
 ### v0.2.0 — the Postgres table changed
 

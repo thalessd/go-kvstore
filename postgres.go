@@ -32,7 +32,7 @@ type statements struct {
 
 func buildStatements(relation string) statements {
 	return statements{
-		get: `SELECT value FROM ` + relation + `
+		get: `SELECT value, expires FROM ` + relation + `
 WHERE namespace = $1 AND key = $2 AND (expires IS NULL OR expires > $3)`,
 
 		upsert: `INSERT INTO ` + relation + ` (namespace, key, value, expires)
@@ -61,6 +61,16 @@ SET value = excluded.value, expires = excluded.expires`,
 // time.Time is a large negative number, which would read as long expired.
 func epoch(moment time.Time) sql.NullInt64 {
 	return sql.NullInt64{Int64: moment.UnixMilli(), Valid: !moment.IsZero()}
+}
+
+// momentOf is the inverse of epoch. UnixMilli returns a Time in the local
+// zone, so the moment is normalized to UTC: Cache[T] hands Set a UTC moment,
+// and a round trip through the column must not change the zone.
+func momentOf(stored sql.NullInt64) time.Time {
+	if !stored.Valid {
+		return time.Time{}
+	}
+	return time.UnixMilli(stored.Int64).UTC()
 }
 
 // Postgres stores entries in one table on the caller's pool. Every statement
@@ -100,18 +110,24 @@ func (p *Postgres) WithTx(tx *sql.Tx) *Postgres {
 }
 
 func (p *Postgres) Get(ctx context.Context, namespace, key string) (json.RawMessage, bool, error) {
+	entry, found, err := p.GetEntry(ctx, namespace, key)
+	return entry.Value, found, err
+}
+
+func (p *Postgres) GetEntry(ctx context.Context, namespace, key string) (Entry, bool, error) {
 	// Scanned as a string because the column is TEXT: database/sql only
 	// assigns a driver string to *[]byte itself, and json.RawMessage is a
 	// named type its reflect path will not take.
 	var value string
-	err := p.db.QueryRowContext(ctx, p.stmt.get, namespace, key, time.Now().UnixMilli()).Scan(&value)
+	var expires sql.NullInt64
+	err := p.db.QueryRowContext(ctx, p.stmt.get, namespace, key, time.Now().UnixMilli()).Scan(&value, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, false, nil
+		return Entry{}, false, nil
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("kvstore get %s/%s: %w", namespace, key, err)
+		return Entry{}, false, fmt.Errorf("kvstore get %s/%s: %w", namespace, key, err)
 	}
-	return json.RawMessage(value), true, nil
+	return Entry{Value: json.RawMessage(value), Expires: momentOf(expires)}, true, nil
 }
 
 func (p *Postgres) Set(ctx context.Context, namespace, key string, value json.RawMessage, expires time.Time) error {
