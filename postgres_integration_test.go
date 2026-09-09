@@ -5,6 +5,7 @@ package kvstore_test
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -142,16 +143,99 @@ func TestSchemasAreIsolated(t *testing.T) {
 	}
 }
 
+// relpersistence is what EnsureSchema checks itself; reading it here keeps the
+// assertions independent of the code under test.
+func relpersistence(t *testing.T, db *sql.DB, schema, table string) string {
+	t.Helper()
+
+	var got string
+	err := db.QueryRowContext(t.Context(), `SELECT c.relpersistence::text
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = $1 AND c.relname = $2`, schema, table).Scan(&got)
+	if err != nil {
+		t.Fatalf("read relpersistence of %s.%s: %v", schema, table, err)
+	}
+	return got
+}
+
 // UNLOGGED goes before TABLE in the grammar, so only a real server proves
 // the DDL parses.
 func TestEnsureSchemaAcceptsUnlogged(t *testing.T) {
-	store := newSchema(t, "kvt_unlogged", kvstore.WithUnlogged())
+	store := newSchema(t, "kvt_unlogged", kvstore.WithPersistence(kvstore.Unlogged))
 
+	if got := relpersistence(t, open(t), "kvt_unlogged", "entries"); got != "u" {
+		t.Errorf("relpersistence = %q, want %q", got, "u")
+	}
 	if err := store.Set(t.Context(), "ns", "k", json.RawMessage(`1`), time.Time{}); err != nil {
 		t.Fatalf("set: %v", err)
 	}
 	if _, found, err := store.Get(t.Context(), "ns", "k"); err != nil || !found {
 		t.Errorf("get from an unlogged table: found=%v err=%v", found, err)
+	}
+}
+
+// The drift the check exists for is the one CREATE ... IF NOT EXISTS swallows,
+// so this builds it for real rather than mocking a catalog row.
+func TestEnsureSchemaDetectsPersistenceDrift(t *testing.T) {
+	db := open(t)
+	opts := []kvstore.Option{kvstore.WithSchema("kvt_drift"), kvstore.WithPersistence(kvstore.Unlogged)}
+
+	newSchema(t, "kvt_drift") // logged, and dropped again on cleanup
+
+	store, err := kvstore.NewPostgres(db, opts...)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	var mismatch *kvstore.PersistenceMismatchError
+	if err := store.EnsureSchema(t.Context()); !errors.As(err, &mismatch) {
+		t.Fatalf("ensure schema: err = %v, want a *PersistenceMismatchError", err)
+	}
+	if mismatch.Want != kvstore.Unlogged || mismatch.Got != kvstore.Logged {
+		t.Errorf("want=%s got=%s, want want=unlogged got=logged", mismatch.Want, mismatch.Got)
+	}
+
+	// The check runs last, so a caller that logs the mismatch instead of
+	// failing still holds a store whose relations all exist.
+	if err := store.Set(t.Context(), "ns", "k", json.RawMessage(`1`), time.Time{}); err != nil {
+		t.Errorf("set after a reported mismatch: %v", err)
+	}
+}
+
+// The conversion is a recreation, so all three effects are the point: the
+// persistence changed, the entries are gone, and the table works afterwards.
+func TestRecreateTableChangesPersistence(t *testing.T) {
+	db := open(t)
+	ctx := t.Context()
+	opts := []kvstore.Option{kvstore.WithSchema("kvt_recreate"), kvstore.WithPersistence(kvstore.Unlogged)}
+
+	logged := newSchema(t, "kvt_recreate")
+	if err := logged.Set(ctx, "ns", "k", json.RawMessage(`1`), time.Time{}); err != nil {
+		t.Fatalf("set before the recreation: %v", err)
+	}
+	if got := relpersistence(t, db, "kvt_recreate", "entries"); got != "p" {
+		t.Fatalf("relpersistence before = %q, want %q", got, "p")
+	}
+
+	if err := kvstore.RecreateTable(ctx, db, opts...); err != nil {
+		t.Fatalf("recreate table: %v", err)
+	}
+	if got := relpersistence(t, db, "kvt_recreate", "entries"); got != "u" {
+		t.Errorf("relpersistence after = %q, want %q", got, "u")
+	}
+
+	store, err := kvstore.NewPostgres(db, opts...)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Errorf("ensure schema after the recreation: %v", err)
+	}
+	if found, err := store.Has(ctx, "ns", "k"); err != nil || found {
+		t.Errorf("the recreation kept an entry: found=%v err=%v", found, err)
+	}
+	if err := store.Set(ctx, "ns", "k", json.RawMessage(`2`), time.Time{}); err != nil {
+		t.Errorf("set after the recreation: %v", err)
 	}
 }
 

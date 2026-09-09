@@ -200,6 +200,16 @@ func TestNewPostgresRejectsAnUnusableRelation(t *testing.T) {
 	}
 }
 
+// The constructor is where a bad layout has to fail: a persistence nobody
+// declared would otherwise reach the DDL as a keyword the store made up.
+func TestNewPostgresRejectsAnUnknownPersistence(t *testing.T) {
+	db, _ := newMockDB(t)
+
+	if _, err := NewPostgres(db, WithPersistence(Persistence(7))); err == nil {
+		t.Error("NewPostgres accepted a persistence outside the declared values")
+	}
+}
+
 var _ Reaper = (*Postgres)(nil)
 var _ DBTX = (*sql.DB)(nil)
 var _ DBTX = (*sql.Tx)(nil)

@@ -32,14 +32,15 @@ The Postgres **table**, on the other hand, is keyv's — column names, widths, `
 
 ```text
 kvstore.go                     Package doc, Store, Purger, Reaper
-options.go                     Option, WithSchema / WithTable / WithUnlogged
+options.go                     Option, WithSchema / WithTable / WithPersistence
 ident.go                       Identifier validation and quoting
 memory.go                      MemoryStore
 postgres.go                    DBTX, Postgres, per-instance statements
-schema.go                      (*Postgres).EnsureSchema, DropSchema
+schema.go                      (*Postgres).EnsureSchema, RecreateTable, DropSchema
 cache.go                       Cache[T]
 kvstoretest/conformance.go     The Store contract, as a runnable suite
 helpers_test.go                Shared test helpers (sqlmock, JSON fixtures)
+schema_test.go                 DDL and the persistence check, against sqlmock
 postgres_integration_test.go   //go:build integration — real PostgreSQL
 compose.yaml                   PostgreSQL for the integration tier, on :55433
 ```
@@ -71,10 +72,13 @@ make tidy             # go mod tidy, failing if it was not already tidy
 | `NewMemory() *MemoryStore` | In-process store |
 | `NewPostgres(db, opts...) (*Postgres, error)` | Durable store; fails on an unusable schema or table name |
 | `(*Postgres).WithTx(tx)` | The same store bound to a transaction, layout carried over |
-| `(*Postgres).EnsureSchema(ctx)` | Creates schema, table and index. Idempotent |
+| `(*Postgres).EnsureSchema(ctx)` | Creates schema, table and index, then verifies the table's persistence. Idempotent |
+| `RecreateTable(ctx, db, opts...)` | Drops and recreates the table at the declared persistence, discarding every entry |
 | `DropSchema(ctx, db, opts...)` | Removes everything `EnsureSchema` created |
 | `NewCache[T](store, namespace, ttl)` | Typed layer: `Get` / `Set(…, ttl…)` / `Delete` |
-| `WithSchema` / `WithTable` / `WithUnlogged` | Physical layout of the Postgres store |
+| `WithSchema` / `WithTable` / `WithPersistence` | Physical layout of the Postgres store |
+| `Persistence` (`Logged` / `Unlogged`) | The table's durability, declared by the caller and asserted by `EnsureSchema` |
+| `PersistenceMismatchError` | What the table is, what the store declares, and both ways to converge them |
 | `DefaultSchema` / `DefaultTable` | `"kvstore"` and `"entries"` |
 | `kvstoretest.Conformance(t, store)` | The contract suite |
 
@@ -128,6 +132,7 @@ These are the invariants a change must not break.
 - **The value column is `TEXT`, and stays `TEXT`.** `JSONB` would reformat what a caller stored, breaking contract item 6. `Get` scans into a `string` and converts, because `database/sql` assigns a driver string to `*[]byte` but not to a named slice type like `json.RawMessage`.
 - **`Delete` passes a `[]string` to `key = ANY($2)`,** which requires a driver that encodes a Go slice as a PostgreSQL array. `pgx/v5/stdlib` does; `lib/pq` needs `pq.Array` and is therefore unsupported as-is.
 - **`WithTx` clones the store.** A copy that lost its layout would write to the default relation while the original reads a configured one.
+- **Persistence is a property of the deployed table, not of the code.** `EnsureSchema` creates the table with the declared persistence and then reads `pg_class.relpersistence` back, because `CREATE ... IF NOT EXISTS` ignores the clause on a table that already exists — without the check a flag that stopped matching its table is a silent no-op, `UNLOGGED` under an application expecting durability included. It never *converts*: `ALTER TABLE ... SET LOGGED/UNLOGGED` rewrites the whole table under `ACCESS EXCLUSIVE`, and a method every replica calls at boot is the worst place for that. The conversion is `RecreateTable`, run deliberately by the operator, and it discards the contents — which is what makes it cheaper than the rewrite, and legitimate only because an unlogged table is already truncated on crash.
 - **The host application owns no DDL.** It supplies a schema name and calls `EnsureSchema`; it never carries a migration for this package's table.
 - **The database role needs `CREATE` on the database** for `EnsureSchema` to work. An application that cannot grant that has to run the DDL as a separate step.
 

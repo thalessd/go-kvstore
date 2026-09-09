@@ -92,9 +92,40 @@ err = sessions.Delete(ctx, id)
 | :--- | :--- | :--- |
 | `WithSchema(name)` | `"kvstore"` | The PostgreSQL schema the store reads, writes and creates |
 | `WithTable(name)` | `"entries"` | The table name, for a store sharing a schema with something else |
-| `WithUnlogged()` | off | Creates the table `UNLOGGED`: faster writes, no crash-safety or replication. Only sensible for a pure cache |
+| `WithPersistence(p)` | `kvstore.Logged` | The table's durability. `kvstore.Unlogged` buys write speed by giving up crash-safety: the table is truncated after a crash, is invisible on a standby and is never replicated, so it is only sensible for a pure cache |
 
 Names are validated — lower-case ASCII, digits and underscore, not starting with a digit, at most 63 bytes — and quoted. `NewPostgres` returns an error on anything else rather than falling back to a default, because a typo would otherwise send every write to the wrong relation.
+
+### Persistence is asserted, not just applied
+
+`EnsureSchema` creates the table with the declared persistence *and then reads
+`pg_class` back to check it*. That is not belt and braces: `CREATE ... IF NOT
+EXISTS` silently ignores the persistence clause on a table that already exists,
+so without the check a declaration that drifted from its table would never be
+heard — including the dangerous direction, an `UNLOGGED` table under an
+application that believes its writes survive a crash.
+
+A drift returns a `*PersistenceMismatchError`, which `errors.As` picks out for a
+caller that would rather log it than fail. The check is the last step, so the
+schema, table and index all exist by then either way.
+
+Converting an existing table is deliberate and belongs to the operator, because
+the two ways out cost different things:
+
+```go
+// Cheap, and discards every entry. The conversion for a cache.
+err := kvstore.RecreateTable(ctx, db, kvstore.WithPersistence(kvstore.Unlogged))
+```
+
+```sql
+-- Keeps the entries, at the price of a full table rewrite under ACCESS EXCLUSIVE.
+ALTER TABLE "kvstore"."entries" SET UNLOGGED;
+```
+
+Neither ever runs at boot: `EnsureSchema` is called by every replica, and a
+rewrite there would freeze the table for the whole fleet.
+
+`WithUnlogged()` is deprecated and means `WithPersistence(kvstore.Unlogged)`.
 
 ## The Store contract
 
