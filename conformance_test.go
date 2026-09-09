@@ -12,3 +12,11 @@ import (
 func TestMemoryConformance(t *testing.T) {
 	kvstoretest.Conformance(t, kvstore.NewMemory())
 }
+
+// Bounding the store must not change what Store means. The bound is well above
+// what the suite writes to any one namespace, because the contract promises
+// nothing about retention: a tight bound would evict entries the suite still
+// expects to read, and would be testing the eviction, not the contract.
+func TestMemoryConformanceBounded(t *testing.T) {
+	kvstoretest.Conformance(t, kvstore.NewMemory(kvstore.WithMaxEntriesPerNamespace(64)))
+}

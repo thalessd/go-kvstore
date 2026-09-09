@@ -4,7 +4,7 @@
 
 `kvstore` is a namespaced key-value store for Go with pluggable backends. Values are JSON, keys are scoped by a namespace, and every entry may carry an expiry moment. Two backends ship with it:
 
-- **`MemoryStore`** — in-process and per-replica. Reads hide expired entries lazily; a full sweep is amortized over writes.
+- **`MemoryStore`** — in-process and per-replica. Reads hide expired entries lazily; a full sweep is amortized over writes. Unbounded by default; `WithMaxEntriesPerNamespace` adds a per-namespace LRU.
 - **`Postgres`** — durable and shared. It owns its own schema, creates its own DDL, and never touches the host application's tables. The table follows `@keyv/postgres` v6: `namespace` and `key` are `VARCHAR(255)`, `value` is `TEXT`, and `expires` is a `BIGINT` millisecond epoch behind a partial index.
 
 **A value is opaque bytes, not a document.** `value` is `TEXT` rather than `JSONB` precisely so that `Get` returns the bytes `Set` was given — a parsing column reorders object keys and drops whitespace, which made the two backends disagree about what `Store` means. Nothing here reads inside the value, so the parse bought nothing and cost a rewrite of every write.
@@ -34,7 +34,7 @@ The Postgres **table**, on the other hand, is keyv's — column names, widths, `
 kvstore.go                     Package doc, Store, Entry, Purger, Reaper
 options.go                     Option, WithSchema / WithTable / WithPersistence
 ident.go                       Identifier validation and quoting
-memory.go                      MemoryStore
+memory.go                      MemoryStore, MemoryOption, the per-namespace LRU
 postgres.go                    DBTX, Postgres, per-instance statements
 schema.go                      (*Postgres).EnsureSchema, RecreateTable, DropSchema
 cache.go                       Cache[T]
@@ -70,7 +70,9 @@ make tidy             # go mod tidy, failing if it was not already tidy
 | `Purger` | `PurgeExpired(ctx, now) (int64, error)` — the explicit sweep |
 | `Reaper` | `Store` + `Purger`; what a long-lived application holds |
 | `DBTX` | What the Postgres store needs from a handle; `*sql.DB` and `*sql.Tx` satisfy it |
-| `NewMemory() *MemoryStore` | In-process store |
+| `NewMemory(opts...) *MemoryStore` | In-process store; unbounded unless an option says otherwise |
+| `MemoryOption` | Configures a `MemoryStore`; separate from `Option`, which is the Postgres layout |
+| `WithMaxEntriesPerNamespace(n)` | Caps each namespace independently with an LRU. Zero or less is unbounded |
 | `NewPostgres(db, opts...) (*Postgres, error)` | Durable store; fails on an unusable schema or table name |
 | `(*Postgres).WithTx(tx)` | The same store bound to a transaction, layout carried over |
 | `(*Postgres).EnsureSchema(ctx)` | Creates schema, table and index, then verifies the table's persistence. Idempotent |
@@ -125,6 +127,10 @@ Documented on `Store` and pinned by `kvstoretest.Conformance`:
 
 These are the invariants a change must not break.
 
+- **The in-memory bound is per namespace, not global.** `cacheable`'s `lruSize` is a flat key count, and it can be: in keyv a namespace is a key *prefix* in one flat store. Here it is a real dimension — part of the primary key, and what `Clear` is scoped to — so the budget follows the model. It also buys the property that matters in a process running more than one cache: a flood in the rate limit's namespace cannot evict the OIDC client cache. The whole-store ceiling is the cap times the number of namespaces, which is computable because namespaces are application constants.
+- **An unbounded `MemoryStore` allocates no recency list and reads under `RLock`.** Unbounded is the default, so it must not pay for the LRU. A bound means promoting on read, promoting writes to the list, and a write therefore needs `Lock` — measured at roughly 2x per read at `-cpu 8` in `BenchmarkMemoryGet`. `max` is immutable after the constructor, which is what lets the read paths branch on it without holding the lock, and `lookupLocked` is the single place the expiry check lives so the two paths cannot drift.
+- **`Has` does not promote.** A probe is not a use; promoting on one would keep alive an entry nobody reads.
+- **The sweep rebuilds, it does not delete key by key.** A Go map never releases its buckets, so a namespace that ballooned and then expired would hold the memory for good. The recency list is rebuilt in the same pass so survivors keep their order.
 - **Production code imports the standard library only.** A driver, a mock or a container belongs behind a test build tag. `postgres.go` reaches PostgreSQL through `database/sql` and never names a driver.
 - **Every statement names the relation fully qualified and quoted.** `search_path` is never consulted, so the store shares a connection pool with a host application safely.
 - **Identifiers are validated, then quoted; nothing else is ever interpolated into SQL.** `validateIdent` is stricter than PostgreSQL — lower-case ASCII, digits and underscore, never leading with a digit, at most 63 bytes. Everything else in a statement is a `$n` parameter.
@@ -150,6 +156,10 @@ Two tiers, and the split is deliberate: **`make test` must never need a containe
 **Unit tier — sqlmock.** `newMockDB(t)` in `helpers_test.go` returns a `*sql.DB` plus the mock, and on cleanup fails the test when an expectation went unmet. It always installs `stringArrayConverter`, because sqlmock's option type is unexported and a variadic wrapper is impossible; the converter is permissive, so tests that do not need it are unaffected. Match statements with `regexp.QuoteMeta` against the fully qualified relation, and use `anyEpoch()` for the millisecond moment the store computes itself — it asserts the `int64`, so a parameter that stopped being an epoch fails there rather than reaching a `BIGINT` column as something else.
 
 **Integration tier — real PostgreSQL.** `//go:build integration`, package `kvstore_test`. It reads `KVSTORE_TEST_DSN` and **skips cleanly when it is unset**, so `go test ./...` stays runnable without a server. Each case gets a schema of its own through `newSchema(t, name)`, which drops, creates and registers a cleanup — so cases cannot see each other's rows and each starts from virgin DDL. What belongs here: anything whose subject is real SQL semantics — that the DDL parses, that `EnsureSchema` is idempotent, that two schemas are genuinely isolated, that `PurgeExpired` counts exactly.
+
+**The benchmark is documentation, not a gate.** `BenchmarkMemoryGet` exists because bounding the
+store changes how reads lock, and that cost should be a number rather than a claim. Run it with
+`-cpu 1,4,8`: the contention is the whole point, so a single-threaded figure hides it.
 
 **Never sleep to test expiry.** `Set` takes an arbitrary expiry moment, so write one in the past. `MemoryStore` and `Cache[T]` also have an injectable `now` for white-box tests.
 

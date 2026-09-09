@@ -7,6 +7,7 @@ A namespaced key-value store for Go with pluggable backends. Values are JSON, ke
 - **Two backends included** — an in-process `MemoryStore` and a durable `Postgres` store.
 - **One contract, verified** — `kvstoretest.Conformance` is a runnable suite every backend must pass, so two stores cannot quietly disagree about what `Store` means.
 - **Byte-transparent** — `Get` returns exactly the bytes `Set` was given. The value column is `TEXT`, not `JSONB`, so nothing reorders your object's keys or strips its whitespace.
+- **The in-memory store can be bounded** — `WithMaxEntriesPerNamespace` caps each namespace independently, so one namespace under load cannot evict another's entries.
 - **A typed layer on top** — `Cache[T]` binds a namespace and a default TTL and handles the JSON, leaving `Store` codec-free.
 - **The library owns its schema** — the Postgres store creates and manages its own PostgreSQL schema, so the application embedding it carries no migration for someone else's table.
 - **No dependencies in production code** — the standard library only. The driver and the mock are test-only.
@@ -31,6 +32,34 @@ store := kvstore.NewMemory()
 err := store.Set(ctx, "sessions", "abc", json.RawMessage(`{"user":"1"}`), time.Now().Add(time.Hour))
 raw, found, err := store.Get(ctx, "sessions", "abc")
 ```
+
+#### Bounding it
+
+`NewMemory()` is **unbounded**, and that is worth understanding before relying on it: reads
+evict expired entries lazily and a sweep reclaims them, but *only what expired*. A namespace
+written with no expiry — which is what `Cache[T].Set(ctx, key, value, 0)` does — grows without
+limit.
+
+`WithMaxEntriesPerNamespace` caps it:
+
+```go
+store := kvstore.NewMemory(kvstore.WithMaxEntriesPerNamespace(10_000))
+```
+
+The cap is **per namespace**, each with its own recency list, so a flood in one namespace cannot
+evict another's entries. The ceiling on the whole store is therefore the cap times the number of
+namespaces, which your application can compute because its namespaces are constants. A count of
+zero or less means unbounded.
+
+Eviction is least-recently-used: a read counts as a use and moves the entry to the front, so an
+entry you keep reading survives even if you never rewrite it. `Has` does not — a probe is not a
+use.
+
+The bound costs something on the read path, because promoting an entry writes to the recency
+list and therefore takes the write lock, while an unbounded store serves reads under a read
+lock. On a 12th-gen i7 with `-cpu 8` that is roughly 509 ns/op bounded against 244 ns/op
+unbounded; `go test -bench BenchmarkMemoryGet` measures it on your own hardware. Both are far
+cheaper than the database round trip a cache exists to avoid.
 
 ### PostgreSQL
 
@@ -107,6 +136,9 @@ if found {
 | `WithSchema(name)` | `"kvstore"` | The PostgreSQL schema the store reads, writes and creates |
 | `WithTable(name)` | `"entries"` | The table name, for a store sharing a schema with something else |
 | `WithPersistence(p)` | `kvstore.Logged` | The table's durability. `kvstore.Unlogged` buys write speed by giving up crash-safety: the table is truncated after a crash, is invisible on a standby and is never replicated, so it is only sensible for a pure cache |
+
+These configure the Postgres store's physical layout; the in-memory store's own option is
+[`WithMaxEntriesPerNamespace`](#bounding-it).
 
 Names are validated — lower-case ASCII, digits and underscore, not starting with a digit, at most 63 bytes — and quoted. `NewPostgres` returns an error on anything else rather than falling back to a default, because a typo would otherwise send every write to the wrong relation.
 
