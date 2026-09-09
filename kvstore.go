@@ -47,9 +47,15 @@ type Entry struct {
 //     exactly as Get does: an expired entry is a miss, so a caller copying an
 //     entry into another store cannot revive one. A miss returns the zero
 //     Entry, and Get and GetEntry agree on both visibility and bytes.
-//   - The expiry moment round-trips to within a millisecond and never later
-//     than what Set was given. A backend may truncate it and may return it in
-//     another location, so compare it with Equal and a tolerance, not ==.
+//   - Entry.Expires is the moment this store stops serving the entry, and is
+//     never later than what Set was given. A leaf backend reports what it was
+//     given, give or take a millisecond it may truncate to, and zero stays
+//     zero; a store layered over another reports its own shorter horizon
+//     instead, including where Set was given zero. So compare the moment with
+//     Equal and a tolerance rather than ==, and read zero as no limit.
+//   - The bytes Get and GetEntry return are read-only. A backend may hand the
+//     same slice to concurrent callers, so a caller that mutates or appends
+//     copies first. A caller precondition, like the two that follow.
 //   - Empty namespace and empty key are caller preconditions, not validated.
 //   - So is a namespace or key of at most 255 characters. A backend may store
 //     them in a column that narrow, so a caller deriving a key from something

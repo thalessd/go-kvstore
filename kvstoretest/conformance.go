@@ -27,13 +27,19 @@ func assertJSON(t *testing.T, got json.RawMessage, want string) {
 	}
 }
 
-// assertMoment allows the millisecond a backend may truncate and refuses the
-// direction that matters: a moment read back as later than it was set would
-// let an entry outlive its window.
-func assertMoment(t *testing.T, got, want time.Time) {
+// assertMomentAtMost checks the one direction every store can promise: the
+// moment it reports is never later than what Set was given, so an entry cannot
+// appear to outlive its window. There is deliberately no lower bound — a store
+// layered over another reports its own shorter horizon — and a zero want means
+// no limit at all. The exact fidelity a leaf backend owes is pinned in that
+// backend's own tests, not here.
+func assertMomentAtMost(t *testing.T, got, want time.Time) {
 	t.Helper()
-	if got.After(want) || want.Sub(got) >= time.Millisecond {
-		t.Errorf("expires = %v, want %v within a millisecond and not later", got, want)
+	if want.IsZero() {
+		return
+	}
+	if got.After(want) {
+		t.Errorf("expires = %v, want no later than %v", got, want)
 	}
 }
 
@@ -175,7 +181,7 @@ func Conformance(t *testing.T, store kvstore.Reaper) {
 	// A tier copies an entry from one store into another and needs the expiry
 	// moment to do it: without it the copy invents a TTL, and one that outlives
 	// the original serves what the original has already forgotten.
-	t.Run("an entry carries the expiry it was set with", func(t *testing.T) {
+	t.Run("an entry carries an expiry no later than it was set with", func(t *testing.T) {
 		expires := time.Now().Add(time.Hour)
 		if err := store.Set(ctx, "conf-entry", "expiring", mustJSON(t, "v"), expires); err != nil {
 			t.Fatalf("set expiring: %v", err)
@@ -185,18 +191,19 @@ func Conformance(t *testing.T, store kvstore.Reaper) {
 			t.Fatalf("get entry: found=%v err=%v", found, err)
 		}
 		assertJSON(t, entry.Value, `"v"`)
-		assertMoment(t, entry.Expires, expires)
+		assertMomentAtMost(t, entry.Expires, expires)
 
 		if err := store.Set(ctx, "conf-entry", "forever", mustJSON(t, "v"), time.Time{}); err != nil {
 			t.Fatalf("set forever: %v", err)
 		}
+		// The moment is not asserted here: a leaf backend reports zero back, but a
+		// layered one reports its own horizon, and both are honest about when they
+		// stop serving. Each backend pins its own answer.
 		entry, found, err = store.GetEntry(ctx, "conf-entry", "forever")
 		if err != nil || !found {
 			t.Fatalf("get entry with no expiry: found=%v err=%v", found, err)
 		}
-		if !entry.Expires.IsZero() {
-			t.Errorf("expires = %v, want zero for an entry that never expires", entry.Expires)
-		}
+		assertJSON(t, entry.Value, `"v"`)
 
 		// An expired entry is a miss here too, or a copy would revive one.
 		if err := store.Set(ctx, "conf-entry", "stale", mustJSON(t, "v"), time.Now().Add(-time.Second)); err != nil {

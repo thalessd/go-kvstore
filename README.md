@@ -184,9 +184,9 @@ Any type satisfying `Store` must honour all of this, and `kvstoretest.Conformanc
 5. `Clear` never leaves its namespace.
 6. `Get` returns the bytes `Set` was given, unchanged — a backend must not reformat the value.
 7. `GetEntry` answers with the value **and its expiry moment**, filtering expiry exactly as `Get` does — an expired entry is a miss, so copying an entry into another store cannot revive one. `Entry.Expires` is zero when the entry never expires, and `Get` and `GetEntry` agree on both visibility and bytes.
-8. The expiry moment round-trips to within a millisecond, and **never later** than what `Set` was given. A backend may truncate it and may return it in another location, so compare with `Equal` and a tolerance rather than `==`.
+8. `Entry.Expires` is **the moment that store stops serving the entry**, and is never later than what `Set` was given. A leaf backend reports what it was given, give or take a millisecond it may truncate to, and zero stays zero; a store layered over another reports its own shorter horizon instead, including where `Set` was given zero. Compare with `Equal` and a tolerance rather than `==`, and read zero as no limit.
 
-An empty namespace or key, and one longer than 255 characters, are caller preconditions rather than validated inputs.
+The bytes `Get` and `GetEntry` return are **read-only**: a backend may hand the same slice to concurrent callers, so a caller that mutates or appends copies first. That, an empty namespace or key, and one longer than 255 characters are caller preconditions rather than validated inputs.
 
 ```go
 func TestMyStore(t *testing.T) {

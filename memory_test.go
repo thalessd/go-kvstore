@@ -234,4 +234,35 @@ func TestMemoryUnboundedKeepsNoRecencyList(t *testing.T) {
 	}
 }
 
+// The exact fidelity of the moment left the conformance suite once a layered
+// store earned the right to report a shorter horizon, so each leaf backend pins
+// its own answer. This store keeps the time.Time it was given, to the
+// nanosecond; TestPostgresGetEntry is the other half.
+func TestMemoryGetEntryKeepsTheMomentExactly(t *testing.T) {
+	ctx := t.Context()
+	store := NewMemory()
+
+	expires := time.Date(2030, 9, 8, 13, 0, 0, 123456789, time.UTC)
+	if err := store.Set(ctx, "ns", "expiring", json.RawMessage(`1`), expires); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	entry, found, err := store.GetEntry(ctx, "ns", "expiring")
+	if err != nil || !found {
+		t.Fatalf("get entry: found=%v err=%v", found, err)
+	}
+	if !entry.Expires.Equal(expires) {
+		t.Errorf("expires = %v, want %v exactly", entry.Expires, expires)
+	}
+
+	if err := store.Set(ctx, "ns", "forever", json.RawMessage(`1`), time.Time{}); err != nil {
+		t.Fatalf("set forever: %v", err)
+	}
+	if entry, _, err = store.GetEntry(ctx, "ns", "forever"); err != nil {
+		t.Fatalf("get entry with no expiry: %v", err)
+	}
+	if !entry.Expires.IsZero() {
+		t.Errorf("expires = %v, want zero for an entry that never expires", entry.Expires)
+	}
+}
+
 var _ Reaper = (*MemoryStore)(nil)
