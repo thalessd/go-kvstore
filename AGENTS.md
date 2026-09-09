@@ -7,6 +7,9 @@
 - **`MemoryStore`** — in-process and per-replica. Reads hide expired entries lazily; a full sweep is amortized over writes. Unbounded by default; `WithMaxEntriesPerNamespace` adds a per-namespace LRU.
 - **`Postgres`** — durable and shared. It owns its own schema, creates its own DDL, and never touches the host application's tables. The table follows `@keyv/postgres` v6: `namespace` and `key` are `VARCHAR(255)`, `value` is `TEXT`, and `expires` is a `BIGINT` millisecond epoch behind a partial index.
 
+On top of those two sits **`TieredStore`**, which is not a third backend but a composition: it
+reads through an L1 and falls back to an L2, and is itself a `Store`.
+
 **A value is opaque bytes, not a document.** `value` is `TEXT` rather than `JSONB` precisely so that `Get` returns the bytes `Set` was given — a parsing column reorders object keys and drops whitespace, which made the two backends disagree about what `Store` means. Nothing here reads inside the value, so the parse bought nothing and cost a rewrite of every write.
 
 On top of the codec-free `Store` sits `Cache[T]`, a typed layer that binds a namespace and a default TTL and marshals values for you.
@@ -38,8 +41,10 @@ memory.go                      MemoryStore, MemoryOption, the per-namespace LRU
 postgres.go                    DBTX, Postgres, per-instance statements
 schema.go                      (*Postgres).EnsureSchema, RecreateTable, DropSchema
 cache.go                       Cache[T]
+tiered.go                      TieredStore, the L1/L2 composition
 kvstoretest/conformance.go     The Store contract, as a runnable suite
 helpers_test.go                Shared test helpers (sqlmock, JSON fixtures)
+tiered_test.go                 The tier, including the backfill race
 schema_test.go                 DDL and the persistence check, against sqlmock
 postgres_integration_test.go   //go:build integration — real PostgreSQL
 compose.yaml                   PostgreSQL for the integration tier, on :55433
@@ -78,6 +83,8 @@ make tidy             # go mod tidy, failing if it was not already tidy
 | `(*Postgres).EnsureSchema(ctx)` | Creates schema, table and index, then verifies the table's persistence. Idempotent |
 | `RecreateTable(ctx, db, opts...)` | Drops and recreates the table at the declared persistence, discarding every entry |
 | `DropSchema(ctx, db, opts...)` | Removes everything `EnsureSchema` created |
+| `TieredStore` | Reads through an L1 and falls back to an L2; a `Store` and a `Reaper` itself |
+| `NewTiered(l1, l2, ttl) (*TieredStore, error)` | Fails on a ttl of zero or less: it is the staleness window between replicas |
 | `NewCache[T](store, namespace, ttl)` | Typed layer: `Get` / `Set(…, ttl…)` / `Delete` |
 | `WithSchema` / `WithTable` / `WithPersistence` | Physical layout of the Postgres store |
 | `Persistence` (`Logged` / `Unlogged`) | The table's durability, declared by the caller and asserted by `EnsureSchema` |
@@ -128,6 +135,11 @@ Documented on `Store` and pinned by `kvstoretest.Conformance`:
 
 These are the invariants a change must not break.
 
+- **A backfill that a write overtook is discarded, and ordering the writes does not do that.** A `Get` that missed L1 and is still reading L2 holds a pre-write value; if it copies that into L1 after a `Set` landed, L1 serves it for a whole ttl and it reads as a lost write. `TieredStore.invalidate` bumps a generation counter **between** the two layers' writes, and `GetEntry` re-reads it before copying: the backfill either sees the bump and drops its copy, or its L1 write lands first and the write that follows overwrites it. Bumping before the L2 write instead leaves the hole open, because a backfill starting after the bump can still read the pre-write value. `cacheable` closes the same race with `primaryBackfillBarrier` and `primaryBackfill.discard()`. The counter is deliberately coarse — any write discards every backfill in flight — which is affordable because a tier only pays for itself under reads.
+- **The tier writes L2 first because of failure, not because of that race.** An L2 that refused the write must not leave L1 answering for it. `cacheable` cannot do this: it fires both in a `Promise.all` and swallows the error.
+- **A tier reports its own horizon, not the expiry it was given.** An L1 hit can only know the capped moment, so reporting the L2 expiry on a miss would make the same key answer differently depending on which layer served it. Contract item 8 is written to allow this.
+- **`nonBlocking` was not copied.** `cacheable` has it; in Go a goroutine outliving the request's `context` loses the write silently when that context is cancelled. It would need `context.WithoutCancel` and an explicit error sink to be honest, and nothing has asked for it.
+- **A failed L1 write fails the read.** Degrading to "no cache" without a word is the silent failure mode this package rejects everywhere else. It cannot happen with the bundled `MemoryStore`.
 - **The in-memory bound is per namespace, not global.** `cacheable`'s `lruSize` is a flat key count, and it can be: in keyv a namespace is a key *prefix* in one flat store. Here it is a real dimension — part of the primary key, and what `Clear` is scoped to — so the budget follows the model. It also buys the property that matters in a process running more than one cache: a flood in the rate limit's namespace cannot evict the OIDC client cache. The whole-store ceiling is the cap times the number of namespaces, which is computable because namespaces are application constants.
 - **An unbounded `MemoryStore` allocates no recency list and reads under `RLock`.** Unbounded is the default, so it must not pay for the LRU. A bound means promoting on read, promoting writes to the list, and a write therefore needs `Lock` — measured at roughly 2x per read at `-cpu 8` in `BenchmarkMemoryGet`. `max` is immutable after the constructor, which is what lets the read paths branch on it without holding the lock, and `lookupLocked` is the single place the expiry check lives so the two paths cannot drift.
 - **`Has` does not promote.** A probe is not a use; promoting on one would keep alive an entry nobody reads.
@@ -157,6 +169,11 @@ Two tiers, and the split is deliberate: **`make test` must never need a containe
 **Unit tier — sqlmock.** `newMockDB(t)` in `helpers_test.go` returns a `*sql.DB` plus the mock, and on cleanup fails the test when an expectation went unmet. It always installs `stringArrayConverter`, because sqlmock's option type is unexported and a variadic wrapper is impossible; the converter is permissive, so tests that do not need it are unaffected. Match statements with `regexp.QuoteMeta` against the fully qualified relation, and use `anyEpoch()` for the millisecond moment the store computes itself — it asserts the `int64`, so a parameter that stopped being an epoch fails there rather than reaching a `BIGINT` column as something else.
 
 **Integration tier — real PostgreSQL.** `//go:build integration`, package `kvstore_test`. It reads `KVSTORE_TEST_DSN` and **skips cleanly when it is unset**, so `go test ./...` stays runnable without a server. Each case gets a schema of its own through `newSchema(t, name)`, which drops, creates and registers a cleanup — so cases cannot see each other's rows and each starts from virgin DDL. What belongs here: anything whose subject is real SQL semantics — that the DDL parses, that `EnsureSchema` is idempotent, that two schemas are genuinely isolated, that `PurgeExpired` counts exactly.
+
+**A test for a race has to be shown to fail.** `TestTieredDropsABackfillAWriteOvertook` is
+deterministic — a fake L2 parks the read after it has fetched the value, so the write lands in a
+known window — and it was validated by neutralizing the generation check and watching L1 come
+back holding the pre-write value. A concurrency test nobody has seen fail is decoration.
 
 **The benchmark is documentation, not a gate.** `BenchmarkMemoryGet` exists because bounding the
 store changes how reads lock, and that cost should be a number rather than a claim. Run it with
@@ -197,6 +214,23 @@ Conventional Commits, with the description in **English**:
 ## Compatibility
 
 Semantic versioning, currently pre-1.0: the API may still change, and a breaking change ships as a `v0.x` bump rather than a new module path. Licensed under BSD-3-Clause.
+
+### v0.6.0 — `Entry.Expires` means the reporting store's horizon
+
+Nothing fails to compile. What changed is a meaning: `Entry.Expires` is the moment *that store*
+stops serving the entry, not the moment `Set` was given. A leaf backend is unaffected — it
+reports what it was given, and zero stays zero — but a store layered over another now reports
+its own shorter horizon, including where `Set` was given zero.
+
+`kvstoretest.Conformance` relaxed accordingly: `assertMomentAtMost` checks only that the moment
+is never later than what `Set` was given. Relaxing cannot turn a passing backend into a failing
+one, and the exact fidelity a leaf owes moved into that backend's own tests.
+
+### v0.5.0 — the in-memory store can be bounded
+
+`NewMemory` takes options now, which is source-compatible: `NewMemory()` still builds an
+unbounded store with the behaviour it always had. `WithMaxEntriesPerNamespace(n)` adds a
+per-namespace LRU.
 
 ### v0.4.0 — `Store` gained `GetEntry`
 

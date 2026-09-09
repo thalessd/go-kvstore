@@ -9,6 +9,7 @@ A namespaced key-value store for Go with pluggable backends. Values are JSON, ke
 - **Byte-transparent** — `Get` returns exactly the bytes `Set` was given. The value column is `TEXT`, not `JSONB`, so nothing reorders your object's keys or strips its whitespace.
 - **The in-memory store can be bounded** — `WithMaxEntriesPerNamespace` caps each namespace independently, so one namespace under load cannot evict another's entries.
 - **A typed layer on top** — `Cache[T]` binds a namespace and a default TTL and handles the JSON, leaving `Store` codec-free.
+- **Two layers, when you want them** — `NewTiered` reads through an in-process L1 and falls back to the store the fleet shares, copying entries down on a miss.
 - **The library owns its schema** — the Postgres store creates and manages its own PostgreSQL schema, so the application embedding it carries no migration for someone else's table.
 - **No dependencies in production code** — the standard library only. The driver and the mock are test-only.
 
@@ -128,6 +129,58 @@ if found {
 ```
 
 `GetEntry` filters expiry exactly as `Get` does, so an expired entry is a miss and a copy can never revive one. The moment comes back to within a millisecond of what `Set` was given and never later than it — the Postgres store keeps a millisecond epoch — so compare it with `Equal` and a tolerance, not `==`.
+
+## The tiered store
+
+`NewTiered` puts an in-process cache in front of the store the fleet shares. It is a `Store`
+itself, so `Cache[T]` and anything else holding a `Store` composes over it unchanged:
+
+```go
+l1 := kvstore.NewMemory(kvstore.WithMaxEntriesPerNamespace(10_000))
+
+// 30s is the staleness window you are accepting. It is required, not defaulted.
+store, err := kvstore.NewTiered(l1, pg, 30*time.Second)
+if err != nil {
+    return err
+}
+
+sessions := kvstore.NewCache[Session](store, "sessions", 30*time.Minute)
+```
+
+A read is answered from L1; on a miss it reads L2 and copies the entry down, with an expiry of
+**whichever comes first** — the entry's own, or the ttl. An entry with no expiry at all gets the
+ttl, so nothing sits in L1 forever.
+
+Writes reach the layers in a fixed order, and each choice is load-bearing:
+
+| | Order | Why |
+| :--- | :--- | :--- |
+| `Set` | L2, then L1 | an L2 that failed must not leave L1 serving what the shared store never received |
+| `Delete` / `Clear` | L2, then L1 | same reason |
+| `Has` | L1, else L2 | no copy is made: a probe is not a use |
+| `PurgeExpired` | both | reports L2's count, the one that matters for a growing table; the layers hold different populations, so a sum would mean nothing |
+
+Errors from either layer propagate. This store returns them rather than degrading silently to
+"no cache".
+
+### What a tier does not give you
+
+**A replica does not see another's `Delete` for up to the ttl.** L1 lives in one process, and
+nothing here carries an invalidation between replicas. Concretely: rotate an OIDC client secret
+on one replica and the others keep answering with the old one until their copies expire. That
+window *is* the mitigation, which is why the ttl is a required argument rather than a defaulted
+one — you are naming the staleness you accept.
+
+**Nothing checks that your L1 is bounded.** `NewTiered` takes a `Store`, and a bound is not
+visible in that type. An unbounded L1 caches whatever anyone reads from L2 until the process
+dies, so pass `NewMemory(kvstore.WithMaxEntriesPerNamespace(n))`.
+
+**There is no `WithTx`.** To compose a kv write with other statements in one transaction, use
+the `Postgres` store directly — a tier cannot join a transaction it has no handle on.
+
+**`Entry.Expires` from a tier is how long the answer is good for**, not when the value dies:
+past that moment the tier reads L2 again. It is therefore shorter than what `Set` was given, and
+never zero. See item 8 of the contract.
 
 ## Configuration
 
